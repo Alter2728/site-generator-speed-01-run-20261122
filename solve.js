@@ -1,8 +1,12 @@
 // Fast drop-in for makefun-site 1.0.0: run(input) returns the same output
-// tree (path -> text) as the reference build, byte for byte, computed with a
-// fused single-pass pipeline: manual scanners instead of regex batteries, a
-// range-based inline renderer that copies plain runs in bulk, per-build slug
-// and date caches, and templates compiled once to plain JS functions.
+// tree (path -> text) as the reference build, byte for byte. The graded path
+// is runJson(input): the whole answer object emitted as one JSON string,
+// built during rendering so no output string is ever scanned twice —
+// markdown HTML and template output are produced already JSON-escaped
+// (static template text pre-escaped at compile time, HTML escapes fused
+// with JSON escapes in a single pass), and run() is JSON.parse(runJson()).
+// Manual scanners instead of regex batteries, a regex-accelerated inline
+// renderer, per-build slug/date caches, lazily compiled templates.
 // Dependency-free ES module; no network, clock, randomness or env reads.
 
 const MARK_RE = /\p{M}/gu;
@@ -20,25 +24,88 @@ function hasSpaceStr(t) {
   return false;
 }
 
-function escapeHtml(text) {
-  let idx = -1;
+// ------------------------------------------------------------ JSON fusion
+
+// A string already in JSON-escaped form (the content of a JSON string
+// literal, without the quotes). Markdown HTML travels through the data
+// model wrapped in JStr so template rendering can insert it raw without
+// re-escaping; the wrapper is invisible to template paths (private field).
+class JStr {
+  #j;
+  #hj;
+  constructor(j) { this.#j = j; }
+  get j() { return this.#j; }
+  get hj() { return this.#hj ?? (this.#hj = jToHtmlJ(this.#j)); }
+}
+
+const jesc = (s) => JSON.stringify(s).slice(1, -1);
+
+// jesc with a clean-string fast path (most raw var values need no escaping).
+function jescFast(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 32 || c === 34 || c === 92 || c >= 0xD800) return jesc(s);
+  }
+  return s;
+}
+
+// HTML-escape then JSON-escape, fused into one regex pass. Equals
+// jesc(escapeHtml(s)): entities carry no JSON-special chars, and every
+// other char is JSON-escaped exactly as JSON.stringify would (lone
+// surrogates become \udXXX, paired surrogates pass through).
+const FUSED_RE = /[&<>"'\\\u0000-\u001f\ud800-\udfff]/g;
+function fusedEscape(text) {
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) { idx = i; break; }
-  }
-  if (idx === -1) return text;
-  let out = text.slice(0, idx);
-  let run = idx;
-  for (let i = idx; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) {
-      if (i > run) out += text.slice(run, i);
-      out += ESC_BY_CODE[c];
-      run = i + 1;
+    if (c < 32 || c === 38 || c === 60 || c === 62 || c === 34 || c === 39 || c === 92 || c >= 0xD800) {
+      return text.replace(FUSED_RE, (ch, off, str) => {
+    switch (ch) {
+      case '&': return '&amp;';
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '"': return '&quot;';
+      case "'": return '&#39;';
+      case '\\': return '\\\\';
+      case '\n': return '\\n';
+      case '\r': return '\\r';
+      case '\t': return '\\t';
+      case '\b': return '\\b';
+      case '\f': return '\\f';
+      default: {
+        const c = ch.charCodeAt(0);
+        if (c >= 0xD800 && c <= 0xDBFF) {
+          const n = str.charCodeAt(off + 1);
+          if (n >= 0xDC00 && n <= 0xDFFF) return ch;
+        } else if (c >= 0xDC00 && c <= 0xDFFF) {
+          const p = str.charCodeAt(off - 1);
+          if (p >= 0xD800 && p <= 0xDBFF) return ch;
+        }
+        return '\\u' + c.toString(16).padStart(4, '0');
+      }
+    }
+  });
     }
   }
-  if (run < text.length) out += text.slice(run);
-  return out;
+  return text;
+}
+
+// J(escapeHtml(plain)) recovered from J(plain): \" becomes &quot;, every
+// other JSON escape (\n, \\, \uXXXX, ...) is already correct for the
+// HTML-escaped form, and literal & < > ' become entities. Backslashes in
+// J form only ever start one of those escapes.
+const J2H_RE = /\\.|[&<>']/g;
+function jToHtmlJ(j) {
+  return j.replace(J2H_RE, (m) => (m.charCodeAt(0) === 92 ? (m === '\\"' ? '&quot;' : m) : ESC_BY_CODE[m.charCodeAt(0)]));
+}
+
+// Whether a plain text run needs JSON escaping at all (control chars,
+// backslash, or any surrogate — paired surrogates take the slow path too,
+// JSON.stringify leaves them untouched).
+const JDIRTY_RE = /[\u0000-\u001f\\\ud800-\udfff]/;
+function flushRun(s, a, b, parts, dirty) {
+  if (b <= a) return;
+  const seg = s.slice(a, b);
+  parts.push(dirty ? jesc(seg) : seg);
 }
 
 function slugify(ctx, text) {
@@ -51,15 +118,29 @@ function slugify(ctx, text) {
   let out = '';
   let gap = false;
   if (ascii) {
-    for (let i = 0; i < text.length; i++) {
+    let i = 0;
+    while (i < text.length) {
       const c = text.charCodeAt(i);
-      let keep = -1;
-      if (c >= 65 && c <= 90) keep = c + 32;
-      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
-      if (keep < 0) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += String.fromCharCode(keep);
+      if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+        let j = i + 1;
+        while (j < text.length) {
+          const d = text.charCodeAt(j);
+          if ((d >= 97 && d <= 122) || (d >= 48 && d <= 57)) j++;
+          else break;
+        }
+        if (gap) out += '-';
+        gap = false;
+        out += text.slice(i, j);
+        i = j;
+      } else if (c >= 65 && c <= 90) {
+        if (gap) out += '-';
+        gap = false;
+        out += String.fromCharCode(c + 32);
+        i++;
+      } else {
+        gap = out.length > 0;
+        i++;
+      }
     }
   } else {
     const plain = text.normalize('NFKD').replace(MARK_RE, '');
@@ -99,18 +180,6 @@ function longDate(ctx, date) {
 
 const SPACE128 = new Uint8Array(128);
 for (let c = 0; c < 128; c++) SPACE128[c] = isSpaceCode(c) ? 1 : 0;
-
-function wordsOf(text) {
-  let n = 0;
-  let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const sp = c < 128 ? SPACE128[c] : isSpaceCode(c) ? 1 : 0;
-    if (sp) inWord = false;
-    else if (!inWord) { inWord = true; n++; }
-  }
-  return n;
-}
 
 function dirOf(path) {
   const i = path.lastIndexOf('/');
@@ -441,8 +510,32 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
+// Root names a template may read, transitively through includes, with
+// lexical loop bindings respected. A template whose reads are only the
+// per-case constants (site/tags/recent) — plus optionally one caller loop
+// variable and 'loop' — renders the same string whenever those inputs are
+// the same, so its output can be memoized per case.
+function ownReads(body, scopes, out) {
+  for (const n of body) {
+    if (n.kind === 'var' || n.kind === 'raw' || n.kind === 'if') {
+      if (!scopes.has(n.path[0])) out.add(n.path[0]);
+      if (n.kind === 'if') {
+        ownReads(n.then, scopes, out);
+        if (n.else !== null) ownReads(n.else, scopes, out);
+      }
+    } else if (n.kind === 'for') {
+      if (!scopes.has(n.path[0])) out.add(n.path[0]);
+      const inner = new Set(scopes);
+      inner.add(n.name);
+      inner.add('loop');
+      ownReads(n.body, inner, out);
+    } else if (n.kind === 'include') out.add('\u0000' + n.name);
+  }
+}
+
 function textOf(v) {
   if (typeof v === 'string') return v;
+  if (v instanceof JStr) return JSON.parse(`"${v.j}"`);
   if (typeof v === 'number') return String(v);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (Array.isArray(v)) return v.map(textOf).join(', ');
@@ -454,12 +547,14 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-// Compile a parsed template to a JS function (R, H, D) -> string.
-// R is the flattened scope object (null-prototype): root vars plus the loop
-// bindings currently in force, saved/restored around each loop body so an
-// include sees exactly the scope the reference chain would. Loop variables
-// of this template resolve lexically at compile time; later path steps go
-// through H.g, which keeps the own-property, objects-only rule.
+// Compile a parsed template to a JS function (R, H, D, P) that pushes
+// JSON-escaped fragments into P. R is the flattened scope object
+// (null-prototype): root vars plus the loop bindings currently in force,
+// saved/restored around each loop body so an include sees exactly the
+// scope the reference chain would. Loop variables of this template
+// resolve lexically at compile time; later path steps keep the
+// own-property, objects-only rule. Static text is JSON-escaped once,
+// here at compile time.
 function hasInclude(body) {
   for (const n of body) {
     if (n.kind === 'include') return true;
@@ -480,17 +575,25 @@ function compileTemplate(nodes) {
       if (m.has(first)) { base = m.get(first); break; }
     }
     let expr = base !== null ? base : `R[${JSON.stringify(first)}]`;
-    for (let k = 1; k < path.length; k++) expr = `(_v=${expr},_v!==null&&typeof _v==='object'&&Object.hasOwn(_v,'${path[k]}')?_v.${path[k]}:undefined)`;
+    for (let k = 1; k < path.length; k++) expr = `H.g(${expr},'${path[k]}')`;
     return expr;
   }
   function gen(body, scopes) {
+    let pending = [];
+    const flushPending = () => {
+      if (pending.length > 0) {
+        lines.push(`P.push(${pending.join('+')});`);
+        pending = [];
+      }
+    };
     for (const n of body) {
-      if (n.kind === 'text') lines.push(`O+=${JSON.stringify(n.text)};`);
-      else if (n.kind === 'var') lines.push(`O+=H.v(${lookupExpr(n.path, scopes)});`);
-      else if (n.kind === 'raw') lines.push(`O+=H.t(${lookupExpr(n.path, scopes)});`);
-      else if (n.kind === 'include') lines.push(`{var f=H.f[${JSON.stringify(n.name)}];if(f!==undefined&&D<8)O+=f(R,H,D+1);}`);
+      if (n.kind === 'text') pending.push(JSON.stringify(jesc(n.text)));
+      else if (n.kind === 'var') pending.push(`((_v=${lookupExpr(n.path, scopes)}),typeof _v==='string'?H.e(_v):H.v(_v))`);
+      else if (n.kind === 'raw') pending.push(`((_v=${lookupExpr(n.path, scopes)}),typeof _v==='string'?H.j(_v):H.t(_v))`);
+      else if (n.kind === 'include') { flushPending(); lines.push(`{var f=H.gf(${JSON.stringify(n.name)});if(f!==undefined&&D<8)f(R,H,D+1,P);}`); }
       else if (n.kind === 'if') {
-        lines.push(`if(H.y(${lookupExpr(n.path, scopes)})!==${n.not}){`);
+        flushPending();
+        lines.push(`if(((_v=${lookupExpr(n.path, scopes)}),_v instanceof H.J?_v.j!=='' : _v!==undefined&&_v!==null&&_v!==false&&_v!==''&&_v!==0&&(!Array.isArray(_v)||_v.length>0))!==${n.not}){`);
         gen(n.then, scopes);
         if (n.else !== null) {
           lines.push('}else{');
@@ -498,6 +601,7 @@ function compileTemplate(nodes) {
         }
         lines.push('}');
       } else if (n.kind === 'for') {
+        flushPending();
         const id = uid++;
         const xs = `x${id}`, ii = `i${id}`, ln = `n${id}`, el = `e${id}`, lp = `l${id}`;
         lines.push(`var ${xs}=${lookupExpr(n.path, scopes)};if(Array.isArray(${xs})){var ${ln}=${xs}.length;for(var ${ii}=0;${ii}<${ln};${ii}++){var ${el}=${xs}[${ii}];var ${lp}={index:${ii}+1,first:${ii}===0,last:${ii}===${ln}-1,length:${ln}};`);
@@ -523,9 +627,10 @@ function compileTemplate(nodes) {
         lines.push('}}');
       }
     }
+    flushPending();
   }
   gen(nodes, []);
-  return new Function('R', 'H', 'D', `var O='';var _v;\n${lines.join('\n')}\nreturn O;`);
+  return new Function('R', 'H', 'D', 'P', `var _v;\n${lines.join('\n')}`);
 }
 
 // ---------------------------------------------------------------- markdown
@@ -726,36 +831,83 @@ function findSingleStar(s, from, end) {
   return -1;
 }
 
-function escapeRange(s, a, b, parts) {
+// Code-span content: HTML-escape fused with JSON-escape, in J form.
+function escapeRangeJ(s, a, b, parts) {
   let run = a;
+  let dirty = false;
   for (let i = a; i < b; i++) {
     const c = s.charCodeAt(i);
     if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) {
-      if (i > run) parts.push(s.slice(run, i));
+      if (i > run) {
+        const seg = s.slice(run, i);
+        parts.push(dirty ? jesc(seg) : seg);
+      }
       parts.push(ESC_BY_CODE[c]);
       run = i + 1;
-    }
+      dirty = false;
+    } else if (c < 32 || c === 92 || c >= 0xD800) dirty = true;
   }
-  if (b > run) parts.push(s.slice(run, b));
+  if (b > run) {
+    const seg = s.slice(run, b);
+    parts.push(dirty ? jesc(seg) : seg);
+  }
 }
 
 const CAT128 = new Uint8Array(128);
 CAT128[92] = 1; CAT128[96] = 2; CAT128[42] = 3; CAT128[91] = 4;
 CAT128[38] = 5; CAT128[60] = 5; CAT128[62] = 5; CAT128[34] = 5; CAT128[39] = 5;
 
+// Next-special scanner: the regex engine skips plain runs natively; the
+// shared regex's lastIndex is reset at every entry and after every
+// recursive call, so recursion cannot disturb an outer scan.
+const SPECRE = /[\\`*\[&<>"'\u0000-\u001f\ud800-\udfff]/g;
+
+const JESC_CTRL = { 8: '\\b', 9: '\\t', 10: '\\n', 12: '\\f', 13: '\\r' };
+
 function renderInline(s, a, b, linkFn, parts) {
-  let i = a;
   let run = a;
-  while (i < b) {
+  const re = SPECRE;
+  re.lastIndex = a;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const i = m.index;
+    if (i >= b) break;
     const c = s.charCodeAt(i);
     const cat = c < 128 ? CAT128[c] : 0;
-    if (cat === 0) { i++; continue; }
-    if (cat === 1 && i + 1 < b && isEscapable(s.charCodeAt(i + 1))) {
-      if (i > run) parts.push(s.slice(run, i));
-      const nc = s.charCodeAt(i + 1);
-      parts.push(nc === 62 ? '&gt;' : s[i + 1]);
-      i += 2;
-      run = i;
+    if (cat === 0) {
+      // A JSON-dirty char inside a plain run: flush the clean slice before
+      // it and emit its JSON escape directly. Paired surrogates stay in
+      // the run (JSON leaves them as-is); lone ones are escaped.
+      if (c >= 0xD800) {
+        if (c <= 0xDBFF) {
+          const n = s.charCodeAt(i + 1);
+          if (n >= 0xDC00 && n <= 0xDFFF) continue;
+        } else {
+          const pv = s.charCodeAt(i - 1);
+          if (pv >= 0xD800 && pv <= 0xDBFF) continue;
+        }
+        if (i > run) parts.push(s.slice(run, i));
+        parts.push('\\u' + c.toString(16));
+        run = i + 1;
+      } else {
+        if (i > run) parts.push(s.slice(run, i));
+        parts.push(JESC_CTRL[c] ?? ('\\u' + c.toString(16).padStart(4, '0')));
+        run = i + 1;
+      }
+      continue;
+    }
+    if (cat === 1) {
+      if (i + 1 < b && isEscapable(s.charCodeAt(i + 1))) {
+        if (i > run) parts.push(s.slice(run, i));
+        const nc = s.charCodeAt(i + 1);
+        parts.push(nc === 62 ? '&gt;' : nc === 92 ? '\\\\' : s[i + 1]);
+        run = i + 2;
+        re.lastIndex = run;
+      } else {
+        if (i > run) parts.push(s.slice(run, i));
+        parts.push('\\\\');
+        run = i + 1;
+      }
       continue;
     }
     if (cat === 2) {
@@ -763,11 +915,11 @@ function renderInline(s, a, b, linkFn, parts) {
       if (j !== -1 && j < b && j > i + 1) {
         if (i > run) parts.push(s.slice(run, i));
         parts.push('<code>');
-        escapeRange(s, i + 1, j, parts);
+        escapeRangeJ(s, i + 1, j, parts);
         parts.push('</code>');
-        i = j + 1;
-        run = i;
-      } else i++;
+        run = j + 1;
+        re.lastIndex = run;
+      }
       continue;
     }
     if (cat === 3) {
@@ -778,9 +930,9 @@ function renderInline(s, a, b, linkFn, parts) {
           parts.push('<strong>');
           renderInline(s, i + 2, j, linkFn, parts);
           parts.push('</strong>');
-          i = j + 2;
-          run = i;
-        } else i += 2;
+          run = j + 2;
+          re.lastIndex = run;
+        } else re.lastIndex = i + 2;
         continue;
       }
       const j = findSingleStar(s, i + 1, b);
@@ -789,66 +941,61 @@ function renderInline(s, a, b, linkFn, parts) {
         parts.push('<em>');
         renderInline(s, i + 1, j, linkFn, parts);
         parts.push('</em>');
-        i = j + 1;
-        run = i;
-      } else i++;
+        run = j + 1;
+        re.lastIndex = run;
+      }
       continue;
     }
     if (cat === 4) {
       const k = findUnescaped(s, ']', i + 1, b);
-      let m = -1;
-      if (k !== -1 && k + 1 < b && s.charCodeAt(k + 1) === 40) m = s.indexOf(')', k + 2);
-      if (m !== -1 && m < b) {
-        const target = s.slice(k + 2, m);
+      let mm = -1;
+      if (k !== -1 && k + 1 < b && s.charCodeAt(k + 1) === 40) mm = s.indexOf(')', k + 2);
+      if (mm !== -1 && mm < b) {
+        const target = s.slice(k + 2, mm);
         if (target !== '' && !hasSpaceStr(target)) {
           if (i > run) parts.push(s.slice(run, i));
-          parts.push('<a href="', linkFn(target), '">');
+          parts.push('<a href=\\"', linkFn(target), '\\">');
           renderInline(s, i + 1, k, linkFn, parts);
           parts.push('</a>');
-          i = m + 1;
-          run = i;
+          run = mm + 1;
+          re.lastIndex = run;
           continue;
         }
       }
-      i++;
       continue;
     }
-    if (cat === 5) {
-      if (i > run) parts.push(s.slice(run, i));
-      parts.push(ESC_BY_CODE[c]);
-      i++;
-      run = i;
-      continue;
-    }
-    i++;
+    if (i > run) parts.push(s.slice(run, i));
+    parts.push(ESC_BY_CODE[c]);
+    run = i + 1;
   }
   if (b > run) parts.push(s.slice(run, b));
 }
 
 const PARTS = [];
 
-function inlineStr(s, linkFn) {
+function inlineStrJ(s, linkFn) {
   PARTS.length = 0;
   renderInline(s, 0, s.length, linkFn, PARTS);
   return PARTS.join('');
 }
 
 const OUT = [];
+const BP = [];
+
+function wordsOfBody(src) {
+  let n = 0;
+  let inWord = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src.charCodeAt(i);
+    const sp = c < 128 ? SPACE128[c] : isSpaceCode(c) ? 1 : 0;
+    if (sp) inWord = false;
+    else if (!inWord) { inWord = true; n++; }
+  }
+  return n;
+}
 
 function renderBody(ctx, src, linkFn) {
   const lines = src.split('\n');
-  let wordCount = 0;
-  for (let li = 0; li < lines.length; li++) {
-    const line = lines[li];
-    const ll = line.length;
-    let inWord = false;
-    for (let i = 0; i < ll; i++) {
-      const c = line.charCodeAt(i);
-      const sp = c < 128 ? SPACE128[c] : isSpaceCode(c) ? 1 : 0;
-      if (sp) inWord = false;
-      else if (!inWord) { inWord = true; wordCount++; }
-    }
-  }
   const ids = new Set();
   const toc = [];
   let excerpt = null;
@@ -866,48 +1013,48 @@ function renderBody(ctx, src, linkFn) {
       const fence = fenceOpen(line);
       if (fence !== null) {
         out.push('<pre><code');
-        if (fence !== '') out.push(' class="language-', fence, '"');
+        if (fence !== '') out.push(' class=\\"language-', fence, '\\"');
         out.push('>');
         i++;
         while (i < N && !isFenceClose(lines[i])) {
-          out.push(escapeHtml(lines[i]), '\n');
+          out.push(fusedEscape(lines[i]), '\\n');
           i++;
         }
         i++;
-        out.push('</code></pre>\n');
+        out.push('</code></pre>\\n');
         continue;
       }
     } else if (c0 === 35) {
       const h = headingOf(line);
       if (h !== null) {
         const id = uniqueSlug(slugify(ctx, h.text), ids);
-        const html = inlineStr(h.text, linkFn);
-        out.push('<h', String(h.depth), ' id="', id, '">', html, '</h', String(h.depth), '>\n');
-        if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
+        const html = inlineStrJ(h.text, linkFn);
+        out.push('<h', String(h.depth), ' id=\\"', id, '\\">', html, '</h', String(h.depth), '>\\n');
+        if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html: new JStr(html) });
         i++;
         continue;
       }
     } else if (c0 === 45 || c0 === 42) {
       if (isHr(line)) {
-        out.push('<hr>\n');
+        out.push('<hr>\\n');
         i++;
         continue;
       }
     }
     if (c0 === 62) {
-      const parts = [];
+      BP.length = 0;
       while (i < N && lines[i].charCodeAt(0) === 62) {
         const l = lines[i];
         const t = trimLine(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
-        if (t !== '') parts.push(t);
+        if (t !== '') BP.push(t);
         i++;
       }
-      if (parts.length === 0) out.push('<blockquote>\n</blockquote>\n');
+      if (BP.length === 0) out.push('<blockquote>\\n</blockquote>\\n');
       else {
-        const joined = parts.join('\n');
-        out.push('<blockquote>\n<p>');
+        const joined = BP.join('\n');
+        out.push('<blockquote>\\n<p>');
         renderInline(joined, 0, joined.length, linkFn, out);
-        out.push('</p>\n</blockquote>\n');
+        out.push('</p>\\n</blockquote>\\n');
       }
       continue;
     }
@@ -916,51 +1063,54 @@ function renderBody(ctx, src, linkFn) {
     if (b !== null || o !== null) {
       const ordered = o !== null;
       const start = ordered ? o.num : 1;
-      out.push(ordered && start !== 1 ? `<ol start="${start}">\n` : ordered ? '<ol>\n' : '<ul>\n');
-      let itemParts = [trimLine(ordered ? o.text : b)];
+      out.push(ordered && start !== 1 ? `<ol start=\\"${start}\\">\\n` : ordered ? '<ol>\\n' : '<ul>\\n');
+      BP.length = 0;
+      BP.push(trimLine(ordered ? o.text : b));
       i++;
       while (i < N) {
         const l = lines[i];
-        const m = ordered ? orderedOf(l) : bulletOf(l);
-        if (m !== null) {
-          const joined = itemParts.join('\n');
+        const mm = ordered ? orderedOf(l) : bulletOf(l);
+        if (mm !== null) {
+          const joined = BP.join('\n');
           out.push('<li>');
           renderInline(joined, 0, joined.length, linkFn, out);
-          out.push('</li>\n');
-          itemParts = [trimLine(ordered ? m.text : m)];
+          out.push('</li>\\n');
+          BP.length = 0;
+          BP.push(trimLine(ordered ? mm.text : mm));
           i++;
         } else if (isContinued(l)) {
-          itemParts.push(trimLine(l));
+          BP.push(trimLine(l));
           i++;
         } else break;
       }
       {
-        const joined = itemParts.join('\n');
+        const joined = BP.join('\n');
         out.push('<li>');
         renderInline(joined, 0, joined.length, linkFn, out);
-        out.push('</li>\n');
+        out.push('</li>\\n');
       }
-      out.push(ordered ? '</ol>\n' : '</ul>\n');
+      out.push(ordered ? '</ol>\\n' : '</ul>\\n');
       continue;
     }
-    const parts = [trimLine(line)];
+    BP.length = 0;
+    BP.push(trimLine(line));
     i++;
     while (i < N && !endsParagraph(lines[i])) {
-      parts.push(trimLine(lines[i]));
+      BP.push(trimLine(lines[i]));
       i++;
     }
-    const joined = parts.join('\n');
+    const joined = BP.join('\n');
     if (excerpt === null) {
-      const html = inlineStr(joined, linkFn);
+      const html = inlineStrJ(joined, linkFn);
       excerpt = html;
-      out.push('<p>', html, '</p>\n');
+      out.push('<p>', html, '</p>\\n');
     } else {
       out.push('<p>');
       renderInline(joined, 0, joined.length, linkFn, out);
-      out.push('</p>\n');
+      out.push('</p>\\n');
     }
   }
-  return { html: out.join(''), toc, excerpt: excerpt ?? '', wordCount };
+  return { html: out.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- links
@@ -994,6 +1144,7 @@ function resolvePath(dirParts, dirStr, rel) {
   return parts.join('/');
 }
 
+// Returns the href in J form: J(escapeHtml(url)), fused in one pass.
 function makeLinkFn(base, dirParts, dirStr, bySource, staticPaths, broken, srcPath) {
   const cache = new Map();
   return (target) => {
@@ -1014,7 +1165,7 @@ function makeLinkFn(base, dirParts, dirStr, bySource, staticPaths, broken, srcPa
         res = target;
       }
     }
-    res = escapeHtml(res);
+    res = fusedEscape(res);
     cache.set(target, res);
     return res;
   };
@@ -1022,24 +1173,120 @@ function makeLinkFn(base, dirParts, dirStr, bySource, staticPaths, broken, srcPa
 
 // ---------------------------------------------------------------- build
 
-export function run(input) {
+export function runJson(input) {
   const ctx = { slugCache: new Map(), dateCache: new Map() };
   const report = [];
-  const templateFns = Object.create(null);
+  const asts = Object.create(null);
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templateFns[name] = compileTemplate(parseTemplate(name, input.templates[name]));
+      asts[name] = parseTemplate(name, input.templates[name]);
     } catch (err) {
       if (err instanceof TemplateError) report.push(err.message);
       else throw err;
     }
   }
+  const readSets = Object.create(null);
+  for (const name of Object.keys(asts)) {
+    const out = new Set();
+    ownReads(asts[name], new Set(), out);
+    readSets[name] = out;
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const name of Object.keys(readSets)) {
+      const out = readSets[name];
+      for (const r of [...out]) {
+        if (r.charCodeAt(0) === 0) {
+          const inc = readSets[r.slice(1)];
+          if (inc !== undefined) {
+            for (const x of inc) {
+              if (!out.has(x)) { out.add(x); changed = true; }
+            }
+          }
+        }
+      }
+    }
+  }
+  // name -> loop var name it may read besides the constants ('' if none),
+  // or undefined when not memoizable.
+  const memoVar = Object.create(null);
+  for (const name of Object.keys(readSets)) {
+    let extra = '';
+    let ok = true;
+    for (const r of readSets[name]) {
+      if (r.charCodeAt(0) === 0 || r === 'site' || r === 'tags' || r === 'recent' || r === 'loop') continue;
+      if (extra === '') extra = r;
+      else if (extra !== r) { ok = false; break; }
+    }
+    if (ok) memoVar[name] = extra;
+  }
+  const memoCache = new Map();
+  const memoWeak = new WeakMap();
+  let siteRef = null;
+  let tagsRef = null;
+  let recentRef = null;
+  const fns = Object.create(null);
   const H = {
-    f: templateFns,
+    J: JStr,
+    e: fusedEscape,
+    j: jescFast,
     g: (v, k) => (v !== null && typeof v === 'object' && Object.hasOwn(v, k) ? v[k] : undefined),
-    t: textOf,
-    v: (v) => escapeHtml(textOf(v)),
-    y: truthy,
+    gf: (name) => {
+      let f = fns[name];
+      if (f === undefined) {
+        const ast = asts[name];
+        if (ast === undefined) return undefined;
+        f = compileTemplate(ast);
+        const mv = memoVar[name];
+        if (mv !== undefined) {
+          const raw = f;
+          f = (R, H, D, P) => {
+            if (R.site !== siteRef || R.tags !== tagsRef || R.recent !== recentRef) {
+              raw(R, H, D, P);
+              return;
+            }
+            if (mv === '') {
+              const key = `${name}@${D}`;
+              let hit = memoCache.get(key);
+              if (hit === undefined) {
+                const tmp = [];
+                raw(R, H, D, tmp);
+                hit = tmp.join('');
+                memoCache.set(key, hit);
+              }
+              P.push(hit);
+              return;
+            }
+            const el = R[mv];
+            if (el === null || typeof el !== 'object') {
+              raw(R, H, D, P);
+              return;
+            }
+            const lp = R.loop;
+            const key = `${name}@${D}@${lp ? lp.index : 0}@${lp ? lp.length : 0}`;
+            let perEl = memoWeak.get(el);
+            if (perEl === undefined) {
+              perEl = new Map();
+              memoWeak.set(el, perEl);
+            }
+            let hit = perEl.get(key);
+            if (hit === undefined) {
+              const tmp = [];
+              raw(R, H, D, tmp);
+              hit = tmp.join('');
+              perEl.set(key, hit);
+            }
+            P.push(hit);
+          };
+        }
+        fns[name] = f;
+      }
+      return f;
+    },
+    t: (v) => (v instanceof JStr ? v.j : jescFast(textOf(v))),
+    v: (v) => (v instanceof JStr ? v.hj : fusedEscape(textOf(v))),
+    y: (v) => (v instanceof JStr ? v.j !== '' : truthy(v)),
   };
   let base = input.site.base_url;
   {
@@ -1079,7 +1326,7 @@ export function run(input) {
       continue;
     }
     const layout = s.data.layout ?? (s.post ? 'post' : 'page');
-    if (templateFns[layout] === undefined) {
+    if (asts[layout] === undefined) {
       report.push(`refused ${s.path}: layout "${layout}" is no template that parses`);
       continue;
     }
@@ -1110,10 +1357,9 @@ export function run(input) {
     const dir = dirOf(s.path);
     const dirParts = dir === '' ? [] : dir.split('/');
     const md = renderBody(ctx, s.body, makeLinkFn(base, dirParts, dir, bySource, staticPaths, broken, s.path));
-    s.html = md.html;
+    s.html = new JStr(md.html);
     s.toc = md.toc;
-    s.excerpt = md.excerpt;
-    s.wordCount = md.wordCount;
+    s.excerpt = new JStr(md.excerpt);
   }
   const posts = kept.filter((s) => s.post);
   posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
@@ -1150,64 +1396,124 @@ export function run(input) {
     if (!s.post) s.tagRefs = ownTags(s).map(({ name, slug }) => bySlug.get(slug) ?? { name, slug, url: '', posts: [] });
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
-  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(ctx, s.data.date) });
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(ctx, s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(s.wordCount / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+  const linkOf = (s) => (s === null ? null : (s.link ?? (s.link = { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(ctx, s.data.date) })));
+  const readingOf = (s) => s.rm ?? (s.rm = Math.max(1, Math.ceil(wordsOfBody(s.body) / 200)));
+  const cardOf = (s) => {
+    const card = {
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: s.data.date === undefined ? '' : longDate(ctx, s.data.date),
+      summary: s.data.summary ?? '',
+      excerpt: s.excerpt,
+      tags: s.tagRefs.map((t) => t.cardTag ?? (t.cardTag = { name: t.name, slug: t.slug, url: t.url })),
+    };
+    Object.defineProperty(card, 'reading_minutes', { enumerable: true, get: () => readingOf(s) });
+    return card;
+  };
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
-  const pageOf = (s) => ({
-    ...(s.post ? cards.get(s) : cardOf(s)),
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  });
-  const output = {};
+  const pageOf = (s) => {
+    const card = s.post ? cards.get(s) : cardOf(s);
+    const page = {
+      title: card.title,
+      url: card.url,
+      date: card.date,
+      date_long: card.date_long,
+      summary: card.summary,
+      excerpt: card.excerpt,
+      tags: card.tags,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: linkOf(s.newer ?? null),
+      older: linkOf(s.older ?? null),
+      is_post: s.post,
+    };
+    Object.defineProperty(page, 'reading_minutes', { enumerable: true, get: () => readingOf(s) });
+    return page;
+  };
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const render = (name, vars) => {
-    const fn = templateFns[name];
-    if (fn === undefined) return null;
-    const R = Object.create(null);
-    R.site = site;
-    R.tags = allTags;
-    R.recent = recent;
-    for (const k of Object.keys(vars)) R[k] = vars[k];
-    return fn(R, H, 0);
+  siteRef = site;
+  tagsRef = allTags;
+  recentRef = recent;
+  const parts = ['{'];
+  const emitted = new Set();
+  let first = true;
+  const keyJson = (key) => {
+    for (let i = 0; i < key.length; i++) {
+      const c = key.charCodeAt(i);
+      if (c < 32 || c === 34 || c === 92 || c >= 0xD800) return JSON.stringify(key);
+    }
+    return `"${key}"`;
   };
-  for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
+  const begin = (key) => {
+    parts.push(first ? '' : ',', keyJson(key), ':"');
+    first = false;
+    emitted.add(key);
+  };
+  const R = Object.create(null);
+  R.site = site;
+  R.tags = allTags;
+  R.recent = recent;
+  const renderInto = (fn, vars) => {
+    R.page = vars.page;
+    R.posts = vars.posts;
+    R.pager = vars.pager;
+    R.tag = vars.tag;
+    fn(R, H, 0, parts);
+  };
+  for (const s of kept) {
+    begin(`${s.outDir}/index.html`);
+    renderInto(H.gf(s.layout), { page: pageOf(s) });
+    parts.push('"');
+  }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
-  for (let k = 1; k <= pages; k++) {
-    const html = render('index', {
-      posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
-      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
-    });
-    if (html !== null) output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
+  const indexFn = H.gf('index');
+  if (indexFn !== undefined) {
+    for (let k = 1; k <= pages; k++) {
+      begin(k === 1 ? 'index.html' : `page/${k}/index.html`);
+      renderInto(indexFn, {
+        posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
+        pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
+      });
+      parts.push('"');
+    }
   }
-  for (const t of tags) {
-    const html = render('tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
-    if (html !== null) output[`tags/${t.slug}/index.html`] = html;
+  const tagFn = H.gf('tag');
+  if (tagFn !== undefined) {
+    for (const t of tags) {
+      begin(`tags/${t.slug}/index.html`);
+      renderInto(tagFn, { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
+      parts.push('"');
+    }
   }
-  const tagsHtml = render('tags', {});
-  if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
+  const tagsFn = H.gf('tags');
+  if (tagsFn !== undefined) {
+    begin('tags/index.html');
+    renderInto(tagsFn, {});
+    parts.push('"');
+  }
   for (const f of statics) {
-    if (Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
-    else output[f.path] = f.content;
+    if (emitted.has(f.path)) {
+      report.push(`shadowed ${f.path}: a built page has its path`);
+      continue;
+    }
+    emitted.add(f.path);
+    if (f.path === 'build-report.txt') continue; // the report overwrites it
+    parts.push(first ? '' : ',', keyJson(f.path), ':"', jesc(f.content), '"');
+    first = false;
   }
   const lines = [...report, ...broken].sort(byCodeUnits);
   lines.push(`built ${kept.filter((s) => !s.post).length} pages, ${posts.length} posts, ${tags.length} tags and ${statics.length} static files`);
-  output['build-report.txt'] = `${lines.join('\n')}\n`;
-  return output;
+  parts.push(first ? '' : ',', '"build-report.txt":"', jesc(`${lines.join('\n')}\n`), '"');
+  parts.push('}');
+  return parts.join('');
+}
+
+export function run(input) {
+  return JSON.parse(runJson(input));
 }
